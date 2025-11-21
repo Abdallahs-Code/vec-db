@@ -13,6 +13,18 @@ class Result:
     actual_ids: List[int]
 
 def run_queries(db, np_rows, top_k, num_runs):
+    """
+    Run multiple queries on a VecDB object and record the time taken.
+
+    Args:
+        db (VecDB): The VecDB object to query.
+        np_rows (np.ndarray): The numpy array of vectors to query.
+        top_k (int): The number of results to retrieve for each query.
+        num_runs (int): The number of queries to run.
+
+    Returns:
+        List[Result]: A list of Result objects, each containing the time taken to run the query and the top-k results.
+    """
     results = []
     for _ in range(num_runs):
         query = np.random.random((1,70))
@@ -32,6 +44,19 @@ def run_queries(db, np_rows, top_k, num_runs):
 
 def eval(results: List[Result]):
     # scores are negative. So getting 0 is the best score.
+    """
+    Evaluate the results of multiple queries on a VecDB object.
+
+    Args:
+        results (List[Result]): A list of Result objects, each containing the time taken to run the query and the top-k results.
+
+    Returns:
+        Tuple[float, float]: A tuple containing the average score and average run time for the queries.
+
+    Notes:
+        The score is calculated as the sum of the negative indices of the retrieved IDs in the actual list of IDs.
+        If the number of retrieved IDs is not equal to top_k, the score is set to the lowest possible score.
+    """
     scores = []
     run_time = []
     for res in results:
