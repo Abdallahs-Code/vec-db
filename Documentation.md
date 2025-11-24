@@ -83,7 +83,33 @@ Then it converts the memmap to a NumPy array.
 Note: this loads the entire database into RAM.
 It should be used only in evaluation or debugging.
 ====================================================================================
-8. Sampling Vectors Efficiently
+8. Inserting New Vectors
+
+To insert new data:
+    1. Determine the old number of records
+    2. Expand the memory-mapped file to fit new rows
+    3. Append the new vectors starting at the new offset
+    4. Flush the file
+
+This keeps the file layout consistent and append-only.
+====================================================================================
+9. Dynamic Clustering Parameters
+
+The system automatically configures clustering parameters based on database size.
+
+Sample Size:
+    - 5% of database size
+Number of Clusters:
+    - Nearest power of 2 of sqrt(db_size)
+    - Example: 1M vectors → 1024 clusters
+Batch Size:
+    - Fixed at 4096 vectors per batch
+    - Optimized for MiniBatch K-Means
+Max Iterations:
+    - Fixed at 200 iterations
+    - Sufficient for convergence across all database sizes
+====================================================================================
+10. Sampling Vectors Efficiently
 
 Sampling must avoid loading all vectors into memory.
 
@@ -95,17 +121,36 @@ The storage layer uses this strategy:
 
 This method scales well even for millions of vectors.
 ====================================================================================
-9. Inserting New Vectors
+11. Training Centroids
 
-To insert new data:
-    1. Determine the old number of records
-    2. Expand the memory-mapped file to fit new rows
-    3. Append the new vectors starting at the new offset
-    4. Flush the file
+Trains MiniBatchKMeans on sampled vectors to generate cluster centroids.
 
-This keeps the file layout consistent and append-only.
+Input:
+    - sampled_vectors: NumPy array of shape (sample_size, 64)
+Process:
+    - Uses MiniBatchKMeans with parameters from compute_clustering_parameters()
+    - random_state=42 ensures reproducible results
+    - Fits the model on sampled vectors
+Output:
+    - Returns cluster centroids as float32 array
+    - Shape: (n_clusters, 64)
 ====================================================================================
-10. Summary
+12. Saving Centroids
+
+Saves cluster centroids to disk using the same binary format as the main database.
+
+Input:
+    - centroids: NumPy array of shape (n_clusters, 64), dtype=float32
+Process:
+    - Creates memory-mapped file at index_path
+    - Writes centroids contiguously in float32 format
+    - Flushes to ensure data is written to disk
+File Format:
+    - Same layout as main database (no headers or metadata)
+    - Each centroid is 64 × 4 = 256 bytes
+    - Total file size = n_clusters × 256 bytes
+====================================================================================
+13. Summary
 To sum up:
 - Vectors are stored contiguously in float32 format
 - Every vector is exactly 256 bytes
