@@ -366,12 +366,11 @@ class VecDB:
         return [s[1] for s in scores]
     
     def load_inverted_list(self, cluster_id: int) -> np.ndarray:
-        """
-        Load inverted list (vector IDs) for the given cluster_id.
-        Returns numpy array dtype uint32 of vector IDs (global row numbers).
-        """
+        # Ensure index_dir exists
         if not hasattr(self, "index_dir"):
             self.index_dir = str(Path(self.index_path).with_suffix('')) + "_idx"
+
+        # Load metadata
         meta_path = os.path.join(self.index_dir, "index_meta.json")
         if not os.path.exists(meta_path):
             raise FileNotFoundError("Index metadata not found. Build the index first.")
@@ -379,12 +378,15 @@ class VecDB:
             meta = json.load(fh)
         file_name = meta["cluster_files"].get(str(cluster_id))
         if file_name is None:
-            return np.array([], dtype=np.uint32)
+            return np.memmap(None, dtype=np.uint32, mode="r", shape=(0,))
         file_path = os.path.join(self.index_dir, file_name)
-        if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
-            return np.array([], dtype=np.uint32)
-        ids = np.fromfile(file_path, dtype=np.uint32)
-        return ids
+        if (not os.path.exists(file_path)) or (os.path.getsize(file_path) == 0):
+            return np.memmap(None, dtype=np.uint32, mode="r", shape=(0,))
+        count = os.path.getsize(file_path) // np.dtype(np.uint32).itemsize
+
+        # Memory-map the file WITHOUT reading it into RAM
+        return np.memmap(file_path, dtype=np.uint32, mode="r", shape=(count,))
+
 
     def get_index_metadata(self) -> dict:
         """Return index metadata as a dict (reads index_meta.json)."""
