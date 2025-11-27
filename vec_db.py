@@ -3,6 +3,8 @@ from sklearn.cluster import MiniBatchKMeans
 import numpy as np
 import os
 import math
+import json
+from pathlib import Path
 
 DB_SEED_NUMBER = 42
 ELEMENT_SIZE = np.dtype(np.float32).itemsize
@@ -203,12 +205,141 @@ class VecDB:
         return np.memmap(self.index_path, dtype=np.float32, mode='r', shape=(n_clusters, DIMENSION))
 
     def _build_index(self):
-        # Build the IVF index by training centroids on sampled vectors.
+        """
+        Build IVF index:
+        1. Compute clustering params
+        2. Train + save centroids if missing
+        3. Load centroids (normalized)
+        4. Assign each vector to nearest centroid (cosine)
+        5. Save inverted lists + metadata
+        """
+
+        # ----------------------------------------------------
+        # 1. Compute clustering parameters
+        # ----------------------------------------------------
         self.compute_clustering_parameters()
-        sampled_vectors = self.sample_for_kmeans()
-        centroids = self.train_centroids(sampled_vectors)
-        self.save_centroids(centroids)
-        # (Actual assignment of vectors to centroids is handled later by inverted lists)
+
+        # ----------------------------------------------------
+        # 2. Train centroids only if index file missing/empty
+        # ----------------------------------------------------
+        need_train = (not os.path.exists(self.index_path) or
+                os.path.getsize(self.index_path) == 0)
+
+        if need_train:
+            sampled_vectors = self.sample_for_kmeans()
+            centroids = self.train_centroids(sampled_vectors)
+
+            # normalize before saving
+            cent_norm = np.linalg.norm(centroids, axis=1, keepdims=True)
+            cent_norm[cent_norm == 0] = 1.0
+            centroids = centroids / cent_norm
+
+            self.save_centroids(centroids)
+
+        # ----------------------------------------------------
+        # 3. Load centroids from disk
+        # ----------------------------------------------------
+        centroids = np.array(
+            self.load_centroids(self.n_clusters),
+            dtype=np.float32
+        )
+
+        # normalize to ensure correctness
+        cent_norm = np.linalg.norm(centroids, axis=1, keepdims=True)
+        cent_norm[cent_norm == 0] = 1.0
+        centroids = centroids / cent_norm
+
+        # ----------------------------------------------------
+        # 4. Make index directory
+        # ----------------------------------------------------
+        self.index_dir = str(Path(self.index_path).with_suffix("")) + "_idx"
+        os.makedirs(self.index_dir, exist_ok=True)
+
+        for old in Path(self.index_dir).glob("cluster_*.ids"):
+            try:
+                old.unlink()
+            except:
+                pass
+
+        # ----------------------------------------------------
+        # 5. Prepare DB reading
+        # ----------------------------------------------------
+        num_records = self._get_num_records()
+        bytes_per_vector = DIMENSION * ELEMENT_SIZE
+        target_chunk_bytes = 16 * 1024 * 1024
+
+        chunk_size = max(1, min(num_records, target_chunk_bytes // bytes_per_vector))
+        chunk_size = int(min(chunk_size, 1 << 16))
+
+        # Create empty cluster files
+        cluster_paths = []
+        for ci in range(self.n_clusters):
+            p = os.path.join(self.index_dir, f"cluster_{ci}.ids")
+            open(p, "wb").close()
+            cluster_paths.append(p)
+
+        data = np.memmap(
+            self.db_path, dtype=np.float32, mode="r",
+            shape=(num_records, DIMENSION)
+        )
+
+        counts = [0] * self.n_clusters
+
+        # ----------------------------------------------------
+        # 6. Chunk assignment (cosine)
+        # ----------------------------------------------------
+        for base in range(0, num_records, chunk_size):
+            end = min(num_records, base + chunk_size)
+            chunk = np.array(data[base:end], dtype=np.float32)  # ensure float32
+
+            # normalize each vector in chunk
+            norms = np.linalg.norm(chunk, axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
+            chunk = chunk / norms
+            chunk = chunk.astype(np.float32)  # ensure float32
+
+            # compute cosine similarity with centroids (already normalized)
+            sims = np.dot(chunk, centroids.T) 
+            assign = np.argmax(sims.astype(np.float32), axis=1)
+
+            # assign IDs to cluster files
+            for ci in np.unique(assign):
+                mask = (assign == ci)
+                loc = np.nonzero(mask)[0]
+                if loc.size == 0:
+                    continue
+
+                g_ids = (base + loc).astype(np.uint32)
+
+                # append all IDs at once to avoid multiple small writes
+                cluster_file_path = cluster_paths[int(ci)]
+                with open(cluster_file_path, "ab") as f:
+                    g_ids.tofile(f)
+
+                counts[int(ci)] += int(loc.size)
+
+        # ----------------------------------------------------
+        # 7. Save metadata
+        # ----------------------------------------------------
+        meta = {
+            "n_clusters": int(self.n_clusters),
+            "num_records": int(num_records),
+            "dimension": int(DIMENSION),
+            "cluster_files": {
+                str(i): os.path.basename(cluster_paths[i])
+                for i in range(self.n_clusters)
+            },
+            "counts": {
+                str(i): int(counts[i])
+                for i in range(self.n_clusters)
+            },  
+            "centroids_file": os.path.basename(self.index_path)
+        }
+
+        with open(os.path.join(self.index_dir, "index_meta.json"), "w") as f:
+            json.dump(meta, f)
+
+
 
     def retrieve(self, query: Annotated[np.ndarray, (1, DIMENSION)], top_k = 5):
         # Retrieve the top-k most similar vectors from the database based on a given query vector.
@@ -233,3 +364,34 @@ class VecDB:
         # here we assume that if two rows have the same score, return the lowest ID
         scores = sorted(scores, reverse=True)[:top_k]
         return [s[1] for s in scores]
+    
+    def load_inverted_list(self, cluster_id: int) -> np.ndarray:
+        """
+        Load inverted list (vector IDs) for the given cluster_id.
+        Returns numpy array dtype uint32 of vector IDs (global row numbers).
+        """
+        if not hasattr(self, "index_dir"):
+            self.index_dir = str(Path(self.index_path).with_suffix('')) + "_idx"
+        meta_path = os.path.join(self.index_dir, "index_meta.json")
+        if not os.path.exists(meta_path):
+            raise FileNotFoundError("Index metadata not found. Build the index first.")
+        with open(meta_path, "r") as fh:
+            meta = json.load(fh)
+        file_name = meta["cluster_files"].get(str(cluster_id))
+        if file_name is None:
+            return np.array([], dtype=np.uint32)
+        file_path = os.path.join(self.index_dir, file_name)
+        if not os.path.exists(file_path) or os.path.getsize(file_path) == 0:
+            return np.array([], dtype=np.uint32)
+        ids = np.fromfile(file_path, dtype=np.uint32)
+        return ids
+
+    def get_index_metadata(self) -> dict:
+        """Return index metadata as a dict (reads index_meta.json)."""
+        if not hasattr(self, "index_dir"):
+            self.index_dir = str(Path(self.index_path).with_suffix('')) + "_idx"
+        meta_path = os.path.join(self.index_dir, "index_meta.json")
+        if not os.path.exists(meta_path):
+            raise FileNotFoundError("Index metadata not found. Build the index first.")
+        with open(meta_path, "r") as fh:
+            return json.load(fh)
