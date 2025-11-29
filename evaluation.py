@@ -1,4 +1,5 @@
 # This snippet of code is to show you a simple evaluate for VecDB class, but the full evaluation for project on the Notebook shared with you.
+import json
 import numpy as np
 from vec_db import VecDB
 import time
@@ -28,17 +29,17 @@ def run_queries(db, np_rows, top_k, num_runs):
     results = []
     for _ in range(num_runs):
         query = np.random.random((1,70))
-        
+
         tic = time.time()
         db_ids = db.retrieve(query, top_k)
         toc = time.time()
         run_time = toc - tic
-        
+
         tic = time.time()
         actual_ids = np.argsort(np_rows.dot(query.T).T / (np.linalg.norm(np_rows, axis=1) * np.linalg.norm(query)), axis= 1).squeeze().tolist()[::-1]
         toc = time.time()
         np_run_time = toc - tic
-        
+
         results.append(Result(run_time, top_k, db_ids, actual_ids))
     return results
 
@@ -80,6 +81,11 @@ def eval(results: List[Result]):
 
 if __name__ == "__main__":
     db = VecDB(db_size = 10**2)
+    print("Number of records:", db._get_num_records())
+
+    meta = db.get_index_metadata()
+    print(json.dumps(meta, indent=4))
+
 
     all_db = db.get_all_rows()
 
