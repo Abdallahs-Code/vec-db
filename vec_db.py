@@ -12,7 +12,7 @@ DIMENSION = 64
 DB_SEED_NUMBER = 42
 
 class VecDB:
-    def __init__(self, database_file_path = "saved_db.dat", index_file_path = "index.dat", new_db = True, db_size = None) -> None:
+    def __init__(self, database_file_path = "saved_db.dat", index_file_path = "index", new_db = True, db_size = None) -> None:
         # Check for database file existence
         if not os.path.isfile(database_file_path):
             print("Database file does NOT exist.")
@@ -37,7 +37,7 @@ class VecDB:
         mmap_vectors = np.memmap(self.db_path, dtype=np.float32, mode='r+', shape=(new_total_records, DIMENSION))
         mmap_vectors[num_old_records:] = rows
         mmap_vectors.flush()
-        self._build_index(inserted=True)
+        self._build_index()
 
     def get_one_row(self, row_num: int) -> np.ndarray:
         # Get a single row from the database
@@ -99,23 +99,25 @@ class VecDB:
         if centroids.dtype != np.float32:
             centroids = centroids.astype(np.float32)
         # Save centroids to disk
-        with open(self.index_path, 'wb') as f:
+        clusters_file_path = os.path.join(self.index_path, "centroids.dat")
+        with open(clusters_file_path, 'wb') as f:
             centroids.tofile(f)
         # Validate with file size
         expected_size = centroids.shape[0] * centroids.shape[1] * ELEMENT_SIZE
-        actual_size = os.path.getsize(self.index_path)
+        actual_size = os.path.getsize(clusters_file_path)
         if actual_size != expected_size:
             raise RuntimeError(
                 f"Centroid file size mismatch. Expected {expected_size} bytes, got {actual_size} bytes"
             )
 
     def load_centroids(self, n_clusters: int) -> np.ndarray:
+        clusters_file_path = os.path.join(self.index_path, "centroids.dat")
         # If centroids file does not exist, raise error
-        if not os.path.exists(self.index_path):
-            raise FileNotFoundError(f"Centroids file not found: {self.index_path}")
+        if not os.path.exists(clusters_file_path):
+            raise FileNotFoundError(f"Centroids file not found: {clusters_file_path}")
         # Validate with file size
         expected_size = n_clusters * DIMENSION * ELEMENT_SIZE
-        actual_size = os.path.getsize(self.index_path)
+        actual_size = os.path.getsize(clusters_file_path)
         if actual_size != expected_size:
             raise ValueError(
                 f"Centroids file size mismatch. Expected {expected_size} bytes "
@@ -123,37 +125,26 @@ class VecDB:
                 f"File may be corrupted or n_clusters is incorrect."
             )
         # Load centroids from disk
-        with open(self.index_path, 'rb') as f:
+        with open(clusters_file_path, 'rb') as f:
             centroids = np.fromfile(f, dtype=np.float32, count=n_clusters * DIMENSION)
         # Reshape to (n_clusters, DIMENSION)
         return centroids.reshape(n_clusters, DIMENSION)
 
-    def _build_index(self, inserted: bool = False) -> None:
+    def _build_index(self) -> None:
         # Compute clustering parameters
         self.compute_clustering_parameters()
         # Check if we need to rebuild index
         need_rebuild = self._should_rebuild_index()
         if need_rebuild:
-            print("Index invalid or outdated. Rebuilding...")
+            print("Building new index...")
             self._cleanup_old_index()
         else:
-            if (inserted):
-                print("Database updated. Rebuilding index...")
-                self._cleanup_old_index()
-            else:
-                print("Index is up-to-date. No rebuild needed.")
-                return
+            print("Index is up-to-date. No rebuild needed.")
+            return
+        # Creating index directory
+        os.makedirs(self.index_path, exist_ok=True)
         # Get or create centroids
         centroids = self._get_or_create_centroids()
-        # Creating  index directory for metadata and cluster files
-        self.index_dir = str(Path(self.index_path).with_suffix("")) + "_idx"
-        os.makedirs(self.index_dir, exist_ok=True)
-        # Clean up old cluster files
-        for old_file in Path(self.index_dir).glob("cluster_*.ids"):
-            try:
-                old_file.unlink()
-            except Exception as e:
-                print(f"Warning: Could not delete {old_file}: {e}")
         # Preparing for vector assignment
         num_records = self._get_num_records()
         # Calculate optimal chunk size
@@ -164,7 +155,7 @@ class VecDB:
         # Create empty cluster files
         cluster_paths = []
         for ci in range(self.n_clusters):
-            cluster_file = os.path.join(self.index_dir, f"cluster_{ci}.ids")
+            cluster_file = os.path.join(self.index_path, f"cluster_{ci}.ids")
             # Ensure file exists and is empty
             with open(cluster_file, 'wb') as f:
                 pass  # Create empty file
@@ -223,23 +214,25 @@ class VecDB:
                 str(i): int(cluster_counts[i])
                 for i in range(self.n_clusters)
             },
-            "centroids_file": os.path.basename(self.index_path),
+            "centroids_file": "centroids.dat",
             "build_timestamp": time.time()
         }
-        metadata_path = os.path.join(self.index_dir, "index_meta.json")
+        metadata_path = os.path.join(self.index_path, "index_meta.json")
         with open(metadata_path, 'w') as f:
             json.dump(metadata, f, indent=2)
         # Verify all cluster files exist
         for cluster_id, cluster_path in enumerate(cluster_paths):
             if not os.path.exists(cluster_path):
                 raise RuntimeError(f"Cluster file {cluster_path} was not created")
+        print("Index build complete.")
 
     def _should_rebuild_index(self) -> bool:
         # If index file doesn't exist, need to build
-        if not os.path.exists(self.index_path):
+        centroids_path = os.path.join(self.index_path, "centroids.dat")
+        if not os.path.exists(centroids_path):
             return True
         # Check if metadata exists
-        metadata_path = os.path.join(str(Path(self.index_path).with_suffix("")) + "_idx", "index_meta.json")
+        metadata_path = os.path.join(self.index_path, "index_meta.json")
         if not os.path.exists(metadata_path):
             return True
         try:
@@ -259,7 +252,7 @@ class VecDB:
                 return True
             # Check if centroids file size is correct
             expected_centroid_size = old_n_clusters * DIMENSION * ELEMENT_SIZE
-            actual_centroid_size = os.path.getsize(self.index_path)
+            actual_centroid_size = os.path.getsize(centroids_path)
             if expected_centroid_size != actual_centroid_size:
                 print(f"Centroid file corrupted: expected={expected_centroid_size}, actual={actual_centroid_size}")
                 return True
@@ -270,25 +263,18 @@ class VecDB:
             return True
 
     def _cleanup_old_index(self):
-        # Delete centroids file
-        if os.path.exists(self.index_path):
-            try:
-                os.remove(self.index_path)
-                print(f"Removed old centroids file: {self.index_path}")
-            except Exception as e:
-                print(f"Warning: Could not remove {self.index_path}: {e}")
-        # Delete index directory
-        self.index_dir = str(Path(self.index_path).with_suffix("")) + "_idx"
-        if os.path.exists(self.index_dir):
+        # Delete old index directory if it exists
+        if os.path.isdir(self.index_path):
             try:
                 import shutil
-                shutil.rmtree(self.index_dir)
-                print(f"Removed old index directory: {self.index_dir}")
+                shutil.rmtree(self.index_path)
+                print(f"Removed old index directory: {self.index_path}")
             except Exception as e:
-                print(f"Warning: Could not remove {self.index_dir}: {e}")
+                print(f"Warning: Could not remove {self.index_path}: {e}")
 
     def _get_or_create_centroids(self) -> np.ndarray:
-        need_training = (not os.path.exists(self.index_path) or os.path.getsize(self.index_path) == 0)
+        centroids_file = os.path.join(self.index_path, "centroids.dat")
+        need_training = (not os.path.exists(centroids_file) or os.path.getsize(centroids_file) == 0)
         if need_training:
             # Train new centroids
             print(f"Training {self.n_clusters} centroids...")
@@ -316,11 +302,8 @@ class VecDB:
             return centroids
 
     def load_inverted_list(self, cluster_id: int) -> np.ndarray:
-        # Ensure index_dir exists
-        if not hasattr(self, "index_dir"):
-            self.index_dir = str(Path(self.index_path).with_suffix('')) + "_idx"
         # Load metadata
-        meta_path = os.path.join(self.index_dir, "index_meta.json")
+        meta_path = os.path.join(self.index_path, "index_meta.json")
         if not os.path.exists(meta_path):
             raise FileNotFoundError("Index metadata not found. Build the index first.")
         with open(meta_path, "r") as fh:
@@ -328,7 +311,7 @@ class VecDB:
         file_name = meta["cluster_files"].get(str(cluster_id))
         if file_name is None:
             return np.memmap(None, dtype=np.uint32, mode="r", shape=(0,))
-        file_path = os.path.join(self.index_dir, file_name)
+        file_path = os.path.join(self.index_path, file_name)
         if (not os.path.exists(file_path)) or (os.path.getsize(file_path) == 0):
             return np.memmap(None, dtype=np.uint32, mode="r", shape=(0,))
         count = os.path.getsize(file_path) // np.dtype(np.uint32).itemsize
@@ -343,10 +326,8 @@ class VecDB:
         q_norm = np.linalg.norm(qn)
         if q_norm > 0:
             qn /= q_norm
-        # Ensure index exists & load metadata
-        if not hasattr(self, "index_dir"):
-            self.index_dir = str(Path(self.index_path).with_suffix('')) + "_idx"
-        meta_path = os.path.join(self.index_dir, "index_meta.json")
+        # Load metadata
+        meta_path = os.path.join(self.index_path, "index_meta.json")
         if not os.path.exists(meta_path):
             raise FileNotFoundError("Index metadata not found. Build the index first.")
         with open(meta_path, "r") as fh:
@@ -403,3 +384,6 @@ class VecDB:
         # Select top_k IDs
         topk_ids = candidate_ids[topk_idx].tolist()
         return [int(x) for x in topk_ids]
+    
+if __name__ == "__main__":
+    db = VecDB(database_file_path="OpenSubtitles_en_20M_emb_64.dat", index_file_path="db_20M", new_db=False)
