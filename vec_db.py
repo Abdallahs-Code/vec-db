@@ -332,39 +332,63 @@ class VecDB:
         print("Index build complete.")
 
     def _should_rebuild_index(self) -> bool:
-        # If index file doesn't exist, need to build
-        centroids_path = os.path.join(self.index_path, "centroids.dat")
-        if not os.path.exists(centroids_path):
-            return True
-        # Check if metadata exists
         metadata_path = os.path.join(self.index_path, "index_meta.json")
+        centroids_path = os.path.join(self.index_path, "centroids.dat")
+        pq_path = os.path.join(self.index_path, "pq_codebook.dat")
+
+        # If any essential file is missing, rebuild
         if not os.path.exists(metadata_path):
             return True
+        if not os.path.exists(centroids_path):
+            return True
+        if not os.path.exists(pq_path):
+            return True
+
         try:
-            # Load existing metadata
-            with open(metadata_path, 'r') as f:
-                old_metadata = json.load(f)
-            # Check if n_clusters matches
-            old_n_clusters = int(old_metadata.get("n_clusters", 0))
+            # Load metadata
+            meta = json.load(open(metadata_path, "r"))
+
+            # Validate number of clusters
+            old_n_clusters = int(meta.get("n_clusters", 0))
             if old_n_clusters != self.n_clusters:
                 print(f"n_clusters mismatch: old={old_n_clusters}, new={self.n_clusters}")
                 return True
-            # Check if num_records matches
-            old_num_records = int(old_metadata.get("num_records", 0))
+
+            # Validate number of records
+            old_num_records = int(meta.get("num_records", 0))
             current_num_records = self._get_num_records()
             if old_num_records != current_num_records:
                 print(f"num_records mismatch: old={old_num_records}, new={current_num_records}")
                 return True
-            # Check if centroids file size is correct
+
+            # Validate centroids file size
             expected_centroid_size = old_n_clusters * DIMENSION * ELEMENT_SIZE
             actual_centroid_size = os.path.getsize(centroids_path)
             if expected_centroid_size != actual_centroid_size:
                 print(f"Centroid file corrupted: expected={expected_centroid_size}, actual={actual_centroid_size}")
                 return True
-            # Index appears valid
+
+            # Validate PQ codebook size
+            pq_meta = meta.get("pq", {})
+            expected_pq_size = pq_meta.get("m", 0) * pq_meta.get("ksub", 0) * pq_meta.get("subdim", 0) * ELEMENT_SIZE
+            actual_pq_size = os.path.getsize(pq_path)
+            if expected_pq_size != actual_pq_size:
+                print(f"PQ codebook corrupted: expected={expected_pq_size}, actual={actual_pq_size}")
+                return True
+
+            # Validate all cluster files exist
+            cluster_files = meta.get("cluster_files", {})
+            for cluster_id, fname in cluster_files.items():
+                cluster_path = os.path.join(self.index_path, fname)
+                if not os.path.exists(cluster_path):
+                    print(f"Cluster file missing: {cluster_path}")
+                    return True
+
+            # All checks passed
             return False
+
         except Exception as e:
-            print(f"Error reading metadata: {e}")
+            print(f"Error reading index metadata or files: {e}")
             return True
 
     def _cleanup_old_index(self):
@@ -415,6 +439,7 @@ class VecDB:
         # 2️⃣ Otherwise train & save
         codebooks = self.train_pq_codebook(samples)
         self.save_pq_codebook(codebooks)
+        print(f"PQ codebook trained and saved to {self.index_path}")
         return codebooks
     
     def _encode_chunk_to_pq(self, chunk_vectors: np.ndarray, pq_codebook: np.ndarray) -> np.ndarray:
@@ -486,12 +511,16 @@ class VecDB:
 
     def retrieve(self, query: Annotated[np.ndarray, (1, DIMENSION)], top_k=5):
         # ------------------------
-        # 1️⃣ Normalize query
+        # 1️⃣ Prepare query
         # ------------------------
-        q = np.asarray(query, dtype=np.float32).reshape(-1)
-        q_norm = np.linalg.norm(q)
+        q_original = np.asarray(query, dtype=np.float32).reshape(-1)
+        
+        # Normalize for centroid selection
+        q_norm = np.linalg.norm(q_original)
         if q_norm > 0:
-            q /= q_norm
+            q_normalized = q_original / q_norm
+        else:
+            q_normalized = q_original
 
         # ------------------------
         # 2️⃣ Load metadata & PQ codebook
@@ -507,18 +536,18 @@ class VecDB:
         codebook = self.load_pq_codebook()  # shape: (m, ksub, d_sub)
 
         # ------------------------
-        # 3️⃣ Compute LUT (lookup table)
+        # 3️⃣ Compute LUT (lookup table) using ORIGINAL query
         # ------------------------
-        q_subs = q.reshape(m, d_sub)
+        q_subs = q_original.reshape(m, d_sub)  # Use unnormalized!
         LUT = np.empty((m, ksub), dtype=np.float32)
         for j in range(m):
             LUT[j] = np.sum((codebook[j] - q_subs[j]) ** 2, axis=1)
 
         # ------------------------
-        # 4️⃣ Choose clusters to search (nprobe)
+        # 4️⃣ Choose clusters to search (nprobe) using NORMALIZED query
         # ------------------------
         centroids = self.load_centroids(n_clusters)
-        sims_to_centroids = centroids.dot(q)
+        sims_to_centroids = centroids.dot(q_normalized)  # Use normalized!
         del centroids  # free memory
         if num_records <= 1_000_000:
             nprobe = 3
@@ -565,9 +594,6 @@ class VecDB:
                 dists += LUT[j, batch_postings['code'][:, j]]
             all_distances[batch_start:batch_end] = dists
 
-        del candidate_postings
-        del LUT
-
         # ------------------------
         # 7️⃣ Select top-k
         # ------------------------
@@ -578,7 +604,12 @@ class VecDB:
             topk_idx = np.argsort(all_distances)[:top_k]
 
         # ------------------------
-        # 8️⃣ Return IDs
+        # 8️⃣ Extract result IDs BEFORE deleting candidate_postings
         # ------------------------
         result_ids = candidate_postings['id'][topk_idx]
+        
+        # Now safe to clean up memory
+        del candidate_postings
+        del LUT
+        
         return [int(x) for x in result_ids]
